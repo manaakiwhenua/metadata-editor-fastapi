@@ -1,15 +1,16 @@
 # CI for metadata-editor-fastapi. Builds the image via the central reusable
-# workflow. The image is consumed by the `metadata-editor` app deploy (one app,
-# two repos -> IMAGE_PROJECT in update-app-manifest.sh). Fork-only (CICD-ADR-008):
-# lives on downstream.
+# workflow (manaakiwhenua/github-workflows) -> prod Harbor. The image is consumed
+# by the `metadata-editor` app deploy (one app, two repos -> IMAGE_PROJECT).
+# Fork-only (CICD-ADR-008): downstream.
+#
+# Image lands at: registry.landcareresearch.co.nz/mwlr-private/metadata-editor-fastapi:<build_id>
 #
 # PREREQUISITES (not yet configured - MT-35):
-#   - Repo variables:  REGISTRY_HOST, REGISTRY_USERNAME
-#   - Repo secrets:    REGISTRY_TOKEN, REGISTRY_CA_CERT
-#   - Harbor robot account + self-hosted `tak-k8s-ci` runner
-#   - The Dockerfile must be on `downstream` first (fastapi PR #2 merged)
-#   - Multi-repo deploy wiring (this image + the web image -> one app) is an
-#     open item; the deploy job lives on the web repo. Registry target: see MT-35.
+#   - Repo variable: HARBOR_USERNAME; secrets: HARBOR_TOKEN, REGISTRY_CA_CERT
+#   - A self-hosted `tak-k8s-ci` runner
+#   - Dockerfile on `downstream` (fastapi PR #2 / MT-34)
+#   - Multi-repo deploy wiring (this image + the web image -> one app) is an open
+#     item; the deploy job lives on the web repo.
 name: CI
 on:
   push:
@@ -27,8 +28,7 @@ jobs:
       image_namespace: mwlr-private
       runs_on: tak-k8s-ci
       push: true
-      registry_host: ${{ vars.REGISTRY_HOST }}
-      registry_username: ${{ vars.REGISTRY_USERNAME }}
+      harbor_username: ${{ vars.HARBOR_USERNAME }}
     secrets:
-      ARTIFACTORY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
       REGISTRY_CA_CERT: ${{ secrets.REGISTRY_CA_CERT }}
