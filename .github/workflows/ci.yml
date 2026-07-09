@@ -1,16 +1,17 @@
 # CI for metadata-editor-fastapi. Builds the image via the central reusable
-# workflow (manaakiwhenua/github-workflows) -> prod Harbor. The image is consumed
-# by the `metadata-editor` app deploy (one app, two repos -> IMAGE_PROJECT).
-# Fork-only (CICD-ADR-008): downstream.
+# workflow (manaakiwhenua/github-workflows) -> prod Harbor, then bumps this
+# image's ref in the `metadata-editor` k8s app.
+#
+# One app, two repos: APP_NAME=metadata-editor (the k8s-apps-config folder),
+# IMAGE_PROJECT=metadata-editor-fastapi (this repo's image slug). Requires
+# github-workflows PR #4 (adds the `image_project` input) to be merged first,
+# otherwise the deploy step fails on an unknown input.
 #
 # Image lands at: registry.landcareresearch.co.nz/mwlr-private/metadata-editor-fastapi:<build_id>
 #
-# PREREQUISITES (not yet configured - MT-35):
-#   - Repo variable: HARBOR_USERNAME; secrets: HARBOR_TOKEN, REGISTRY_CA_CERT
-#   - A self-hosted `tak-k8s-ci` runner
-#   - Dockerfile on `downstream` (fastapi PR #2 / MT-34)
-#   - Multi-repo deploy wiring (this image + the web image -> one app) is an open
-#     item; the deploy job lives on the web repo.
+# Prereqs: org var HARBOR_USERNAME; org secrets HARBOR_TOKEN, REGISTRY_CA_CERT,
+# K8S_APPS_CONFIG_TRIGGER_TOKEN; self-hosted `tak-k8s-ci` runner; Dockerfile on
+# `downstream`; the metadata-editor app dir present in k8s-apps-config (MT-36).
 name: CI
 on:
   push:
@@ -32,3 +33,22 @@ jobs:
     secrets:
       HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
       REGISTRY_CA_CERT: ${{ secrets.REGISTRY_CA_CERT }}
+  deploy-dev:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: k8s-dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: manaakiwhenua/github-workflows
+          sparse-checkout: actions/k8s-deploy
+          path: .github-workflows
+      - name: Bump the FastAPI image in the metadata-editor app (dev)
+        uses: ./.github-workflows/actions/k8s-deploy
+        with:
+          app_name: metadata-editor
+          image_project: metadata-editor-fastapi
+          environment: dev
+          cluster: tak-k8s-nonprod
+          build_key: ${{ needs.build.outputs.build_id }}
+          bitbucket_token: ${{ secrets.K8S_APPS_CONFIG_TRIGGER_TOKEN }}
