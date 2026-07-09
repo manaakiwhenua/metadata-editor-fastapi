@@ -1,0 +1,34 @@
+# CI for metadata-editor-fastapi. Builds the image via the central reusable
+# workflow. The image is consumed by the `metadata-editor` app deploy (one app,
+# two repos -> IMAGE_PROJECT in update-app-manifest.sh). Fork-only (CICD-ADR-008):
+# lives on downstream.
+#
+# PREREQUISITES (not yet configured - MT-35):
+#   - Repo variables:  REGISTRY_HOST, REGISTRY_USERNAME
+#   - Repo secrets:    REGISTRY_TOKEN, REGISTRY_CA_CERT
+#   - Harbor robot account + self-hosted `tak-k8s-ci` runner
+#   - The Dockerfile must be on `downstream` first (fastapi PR #2 merged)
+#   - Multi-repo deploy wiring (this image + the web image -> one app) is an
+#     open item; the deploy job lives on the web repo. Registry target: see MT-35.
+name: CI
+on:
+  push:
+    branches: [downstream]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    uses: manaakiwhenua/github-workflows/.github/workflows/docker-build.yml@main
+    with:
+      bake_file: docker-bake.hcl
+      bake_target: default
+      image_name: metadata-editor-fastapi
+      image_namespace: mwlr-private
+      runs_on: tak-k8s-ci
+      push: true
+      registry_host: ${{ vars.REGISTRY_HOST }}
+      registry_username: ${{ vars.REGISTRY_USERNAME }}
+    secrets:
+      ARTIFACTORY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+      REGISTRY_CA_CERT: ${{ secrets.REGISTRY_CA_CERT }}
