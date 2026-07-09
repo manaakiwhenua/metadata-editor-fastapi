@@ -1,0 +1,16 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+.env
+.env.*
+logs/*
+!logs/index.html
+jobs/*
+!jobs/index.html
+external/geometadatatools/.git
+*.ipynb
+requirements-geospatial.txt
