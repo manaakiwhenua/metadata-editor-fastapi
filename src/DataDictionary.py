@@ -9,11 +9,22 @@ from src.FileInfo import FileInfo
 from src.VarInfo import VarInfo
 from src.DictParams import DictParams
 from src.DataUtils import DataUtils
+from src.DataDictionaryWeightValidation import validate_weight_columns_for_descr_stats
+from src.weighted_freq_key import weighted_freq_category_key, sort_category_items, merge_category_value_counts
+from src.utils.dta_reader import read_dta, should_use_chunked_read, iter_dta_chunks, dta_read_snapshot
+from src.utils.dta_chunked_stats import ChunkedDictionaryStats
 from statsmodels.stats.weightstats import DescrStatsW
 from fastapi.exceptions import HTTPException
 
 logger = logging.getLogger(__name__)
 
+
+def _missing_values_as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    return [v]
 
 
 class DataDictionary:
@@ -23,78 +34,18 @@ class DataDictionary:
         file_ext=os.path.splitext(fileinfo.file_path)[1]
 
         if file_ext.lower() == '.dta':
-            # List of encodings to try in order - includes more robust encodings for problematic files
-            encodings_to_try = [
-                None, 
-                "utf-8", 
-                "latin1", 
-                "cp1252", 
-                "iso-8859-1", 
-                "cp850",
-                "cp437",
-                "windows-1252",
-                "ascii",
-                "utf-16"
-            ]
-            
-            df, meta = None, None
-            last_error = None
-                
-            for encoding in encodings_to_try:
-                try:
-                    if encoding is None:
-                        # Try without specifying encoding first (default behavior)
-                        df, meta = pyreadstat.read_dta(
-                            fileinfo.file_path, 
-                            metadataonly=metadataonly, 
-                            usecols=usecols, 
-                            user_missing=True
-                        )
-                    else:
-                        df, meta = pyreadstat.read_dta(
-                            fileinfo.file_path, 
-                            metadataonly=metadataonly, 
-                            usecols=usecols, 
-                            user_missing=True, 
-                            encoding=encoding
-                        )
-                    break
-                    
-                except (pyreadstat.ReadstatError, UnicodeDecodeError, UnicodeError, ValueError) as e:
-                    last_error = e
-                    continue  # Try next encoding
-                
-            # If all encodings failed, raise the last error
-            if df is None or meta is None:
-                # Second attempt: try all encodings again with user_missing=False
-                
-                for encoding in encodings_to_try:
-                    try:
-                        if encoding is None:
-                            df, meta = pyreadstat.read_dta(
-                                fileinfo.file_path, 
-                                metadataonly=metadataonly, 
-                                usecols=usecols, 
-                                user_missing=False
-                            )
-                        else:
-                            df, meta = pyreadstat.read_dta(
-                                fileinfo.file_path, 
-                                metadataonly=metadataonly, 
-                                usecols=usecols, 
-                                user_missing=False, 
-                                encoding=encoding
-                            )
-                        break
-                        
-                    except (pyreadstat.ReadstatError, UnicodeDecodeError, UnicodeError, ValueError) as e:
-                        last_error = e
-                        continue  # Try next encoding
-                
-                # If still failed after trying all encodings with and without user_missing 
-                if df is None or meta is None:
-                    logger.error(f"Failed to read DTA file. Last error: {str(last_error)}")
-                    raise HTTPException(400, detail=f"Failed to read DTA file. Last error: {str(last_error)}")
+            try:
+                df, meta = read_dta(
+                    fileinfo.file_path,
+                    metadataonly=metadataonly,
+                    usecols=usecols,
+                    user_missing=True,
+                )
+            except Exception as e:
+                logger.error("Failed to read DTA file. Last error: %s", e)
+                raise HTTPException(
+                    400, detail=f"Failed to read DTA file. Last error: {str(e)}"
+                ) from e
 
         elif file_ext.lower() == '.sav':
             encodings_to_try = [
@@ -260,6 +211,224 @@ class DataDictionary:
         }
 
 
+    def _prepare_dataframe_missings(self, df, missings):
+        """Apply user-missing replacement and numeric coercion used before summarization."""
+        if missings:
+            df.replace(missings, np.nan, inplace=True)
+
+        for col in df.columns:
+            if not missings or col not in missings:
+                continue
+            if df[col].dtype == 'object' or pd.api.types.is_string_dtype(df[col]):
+                try:
+                    non_null_values = df[col].dropna()
+                    if len(non_null_values) > 0:
+                        converted = pd.to_numeric(non_null_values, errors='coerce')
+                        if converted.notna().sum() == len(non_null_values):
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                except Exception:
+                    pass
+
+        df.fillna(pd.NA, inplace=True)
+        return df.convert_dtypes()
+
+    def _variable_sumstats_from_column_stats(self, col_stats, user_missings=None):
+        if col_stats.is_numeric:
+            stddev = col_stats.stddev()
+            return [
+                {"type": "vald", "value": str(col_stats.valid_count)},
+                {"type": "invd", "value": str(col_stats.invalid_count)},
+                {"type": "min", "value": str(col_stats.min_value)},
+                {"type": "max", "value": str(col_stats.max_value)},
+                {"type": "mean", "value": str(col_stats.mean)},
+                {"type": "stdev", "value": str(stddev if stddev is not None else "")},
+            ]
+        return [
+            {"type": "vald", "value": str(col_stats.valid_count)},
+            {"type": "invd", "value": str(col_stats.invalid_count)},
+        ]
+
+    def _variable_valid_range_from_column_stats(self, col_stats):
+        if col_stats.is_numeric:
+            return {
+                "range": {
+                    "UNITS": "REAL",
+                    "count": int(col_stats.valid_count),
+                    "min": str(col_stats.min_value),
+                    "max": str(col_stats.max_value),
+                }
+            }
+        return {
+            "range": {
+                "UNITS": "REAL",
+                "count": int(col_stats.valid_count),
+            }
+        }
+
+    def _variable_categories_from_column_stats(
+        self,
+        col_stats,
+        meta,
+        variable_name,
+        user_missings=None,
+        categorical_list=None,
+    ):
+        user_missings = user_missings or []
+        categorical_list = categorical_list or []
+        categories = {}
+
+        if variable_name in meta.variable_value_labels:
+            categories = meta.variable_value_labels[variable_name]
+            categories_calc = col_stats.value_counts
+        elif variable_name in categorical_list:
+            categories_calc = col_stats.value_counts
+        else:
+            return []
+
+        categories_calc = merge_category_value_counts(categories_calc)
+        if variable_name in categorical_list and len(categories_calc) > 1000:
+            sorted_items = sorted(
+                categories_calc.items(), key=lambda item: item[1], reverse=True
+            )[:1000]
+            categories_calc = dict(sorted_items)
+
+        output = []
+        for cat, freq in sort_category_items(categories_calc.items()):
+            is_missing = int(str(cat) in user_missings or cat in user_missings)
+            catgry = {
+                "value": str(cat),
+                "stats": [{"type": "freq", "value": str(freq)}],
+            }
+            if is_missing:
+                catgry["is_missing"] = 1
+            output.append(catgry)
+
+        if categories:
+            is_numeric_column = col_stats.is_numeric
+            for catgry in output:
+                if is_numeric_column:
+                    try:
+                        catgry["labl"] = categories.get(int(catgry["value"]), "")
+                    except (ValueError, TypeError):
+                        catgry["labl"] = categories.get(catgry["value"], "")
+                else:
+                    catgry["labl"] = categories.get(catgry["value"], "")
+
+        return output
+
+    def _variable_summary_from_column_stats(
+        self,
+        col_stats,
+        meta,
+        variable_name,
+        user_missings=None,
+        categorical_list=None,
+    ):
+        user_missings = user_missings or []
+        variable_categories = self._variable_categories_from_column_stats(
+            col_stats,
+            meta,
+            variable_name,
+            user_missings=user_missings,
+            categorical_list=categorical_list,
+        )
+        variable_has_categories = bool(variable_categories)
+
+        return {
+            "name": variable_name,
+            "labl": meta.column_names_to_labels[variable_name],
+            "var_intrvl": self.variable_measure(
+                meta, variable_name, variable_has_categories
+            ),
+            "loc_width": meta.variable_display_width[variable_name],
+            "var_invalrng": {
+                "values": self.variable_missing_values(meta, variable_name)
+            },
+            "var_valrng": self._variable_valid_range_from_column_stats(col_stats),
+            "var_sumstat": self._variable_sumstats_from_column_stats(
+                col_stats, user_missings=user_missings
+            ),
+            "var_catgry": variable_categories,
+            "var_catgry_labels": self.variable_categories(meta, variable_name),
+            "var_format": self.variable_format(meta, variable_name),
+            "var_format_original": self.variable_format(meta, variable_name),
+        }
+
+    def _weighted_freq_from_stats(self, weighted_stats):
+        output = {}
+        for val, raw in weighted_stats.freq.items():
+            k = weighted_freq_category_key(val)
+            raw = float(raw)
+            output[k] = int(round(raw)) if abs(raw - round(raw)) < 1e-9 else raw
+        return output
+
+    def _get_data_dictionary_variable_chunked(self, params: DictParams, columns):
+        _, meta = read_dta(
+            params.file_path,
+            metadataonly=True,
+            usecols=columns,
+            user_missing=True,
+        )
+
+        if not params.missings or len(params.missings) == 0:
+            if hasattr(meta, "missing_user_values") and meta.missing_user_values is not None:
+                params.missings = meta.missing_user_values
+            else:
+                params.missings = {}
+
+        missings_map = params.missings or {}
+        stats = ChunkedDictionaryStats(list(meta.column_names))
+        weight_pairs = [(str(w.field), str(w.weight_field)) for w in params.weights]
+        validated_weights = not weight_pairs
+
+        with dta_read_snapshot(params.file_path) as stable_path:
+            for chunk, _chunk_meta in iter_dta_chunks(
+                stable_path,
+                usecols=columns,
+                user_missing=True,
+            ):
+                chunk = self._prepare_dataframe_missings(chunk.copy(), missings_map)
+                if weight_pairs and not validated_weights:
+                    for weight in params.weights:
+                        validate_weight_columns_for_descr_stats(
+                            chunk, weight.field, weight.weight_field
+                        )
+                    validated_weights = True
+                stats.update_chunk(chunk, missings_map, weight_pairs=weight_pairs)
+
+        variables = []
+        for name in meta.column_names:
+            user_missings = _missing_values_as_list(missings_map.get(name, []))
+            variables.append(
+                self._variable_summary_from_column_stats(
+                    stats.column_stats(name),
+                    meta,
+                    name,
+                    user_missings=user_missings,
+                    categorical_list=params.categorical,
+                )
+            )
+
+        weights = {}
+        if weight_pairs:
+            for weight in params.weights:
+                weighted_stats = stats.weighted_stats(str(weight.field))
+                if weighted_stats is None:
+                    continue
+                weights[weight.field] = {
+                    "wgt_freq": self._weighted_freq_from_stats(weighted_stats),
+                    "wgt_mean": weighted_stats.mean(),
+                    "wgt_stdev": weighted_stats.stddev(),
+                }
+            self.apply_weighted_freq_to_variables(variables, weights)
+
+        return {
+            "rows": meta.number_rows,
+            "columns": meta.number_columns,
+            "variables": variables,
+            "weights": weights,
+        }
+
     def get_data_dictionary_variable(self, params: DictParams):
         try:
             if (len(params.var_names) == 0):
@@ -270,6 +439,14 @@ class DataDictionary:
                 for w in params.weights:
                     columns.append(str(w.field))
                     columns.append(str(w.weight_field))
+
+            file_ext = os.path.splitext(params.file_path)[1].lower()
+            if file_ext == ".dta" and should_use_chunked_read(
+                params.file_path,
+                usecols=columns,
+                user_missing=True,
+            ):
+                return self._get_data_dictionary_variable_chunked(params, columns)
 
             df,meta = self.load_file(params,metadataonly=False,usecols=columns)
 
@@ -283,49 +460,29 @@ class DataDictionary:
                     params.missings = {}
             
             # Replace missing values with NaN if any are defined
-            if params.missings:
-                df.replace(params.missings, np.nan, inplace=True)
-            
-            # for columns with user missings (e.g. .a, .b etc. in Stata)
-            # try to convert to numeric
-            for col in df.columns:
-                # only apply to columns in params.missings
-                if not params.missings or col not in params.missings:
-                    continue
-                
-                if df[col].dtype == 'object' or pd.api.types.is_string_dtype(df[col]):
-                    # test if column can be converted to numeric
-                    try:
-                        # Check if all non-null values can be converted to numeric
-                        non_null_values = df[col].dropna()
-                        if len(non_null_values) > 0:
-                            # Try converting to numeric - if successful with no NaN introduced, convert
-                            converted = pd.to_numeric(non_null_values, errors='coerce')
-                            # If no values became NaN during conversion, all values are numeric
-                            if converted.notna().sum() == len(non_null_values):
-                                df[col] = pd.to_numeric(df[col], errors='coerce')
-                    except Exception:
-                        # If any error occurs, leave column as is
-                        pass
-            
-            
             try:
-                df.fillna(pd.NA,inplace=True)
-                #df.fillna(0,inplace=True)
-                df=df.convert_dtypes()
+                df = self._prepare_dataframe_missings(df, params.missings)
             except Exception as e:
-                raise HTTPException(500, detail=f"Failed to process data types: {str(e)}")
+                raise HTTPException(500, detail=f"Failed to process data types: {str(e)}") from e
 
             variables = []
             try:
                 for name in meta.column_names:
-                    user_missings=[]
+                    user_missings = []
                     if params.missings:
-                        for missing_col, missings in params.missings.items():                
-                                if missing_col == name:
-                                    user_missings=missings
-                                    break
-                    variables.append(self.variable_summary(df,meta,name,user_missings=user_missings))
+                        for missing_col, missings in params.missings.items():
+                            if missing_col == name:
+                                user_missings = _missing_values_as_list(missings)
+                                break
+                    variables.append(
+                        self.variable_summary(
+                            df,
+                            meta,
+                            name,
+                            user_missings=user_missings,
+                            categorical_list=params.categorical,
+                        )
+                    )
             except Exception as e:
                 logger.error(f"Failed to process variables: {str(e)}")
                 raise HTTPException(500, detail=f"Failed to process variables: {str(e)}")
@@ -334,22 +491,36 @@ class DataDictionary:
 
             if len(params.weights) > 0:
                 try:
+                    missings_map = params.missings or {}
                     for weight in params.weights:
-                        # Check if weight fields exist in the data
-                        if weight.field not in df.columns:
-                            raise HTTPException(400, detail=f"Weight field '{weight.field}' not found in data")
-                        if weight.weight_field not in df.columns:
-                            raise HTTPException(400, detail=f"Weight field '{weight.weight_field}' not found in data")
-                        
-                        weighted_=self.calc_weighted_mean_n_stddev(df,weight.field, weight.weight_field)
-                        weights[weight.field]={
-                                'wgt_freq': self.calc_weighted_freq(df,weight.field, weight.weight_field),
-                                'wgt_mean': weighted_['mean'],
-                                'wgt_stdev': weighted_['stdev']
-                            }
+                        validate_weight_columns_for_descr_stats(
+                            df, weight.field, weight.weight_field
+                        )
+                        u_field = _missing_values_as_list(missings_map.get(weight.field))
+                        u_wgt = _missing_values_as_list(missings_map.get(weight.weight_field))
+                        weighted_ = self.calc_weighted_mean_n_stddev(
+                            df,
+                            weight.field,
+                            weight.weight_field,
+                            user_missings=u_field,
+                            weight_missings=u_wgt,
+                        )
+                        weights[weight.field] = {
+                            "wgt_freq": self.calc_weighted_freq(
+                                df,
+                                weight.field,
+                                weight.weight_field,
+                                user_missings=u_field,
+                                weight_missings=u_wgt,
+                            ),
+                            "wgt_mean": weighted_["mean"],
+                            "wgt_stdev": weighted_["stdev"],
+                        }
 
                     #add weights stats to variables
                     self.apply_weighted_freq_to_variables(variables, weights)
+                except HTTPException:
+                    raise
                 except Exception as e:
                     raise HTTPException(500, detail=f"Failed to calculate weights: {str(e)}")
                 
@@ -373,54 +544,68 @@ class DataDictionary:
             if (variable['name'] in weights_obj):
                 DataUtils.set_variable_wgt_mean(variable,weighted_mean=weights_obj[variable['name']]['wgt_mean'])
                 DataUtils.set_variable_wgt_stddev(variable,value=weights_obj[variable['name']]['wgt_stdev'])
-                for var_catgry in variable['var_catgry']:            
+                for var_catgry in variable['var_catgry']:
                     var_catgry['stats'].append(
-                        DataUtils.set_wgt_stats_by_value(weights_obj,field=variable['name'],value=int(var_catgry['value']))
+                        DataUtils.set_wgt_stats_by_value(
+                            weights_obj,
+                            field=variable['name'],
+                            value=var_catgry['value'],
+                        )
                     )
 
 
 
 
-    def calc_weighted_freq(self, df, col_name, wgt_col_name):
-        result=df.groupby(col_name)[wgt_col_name].sum().to_dict()
+    def calc_weighted_freq(
+        self, df, col_name, wgt_col_name, user_missings=None, weight_missings=None
+    ):
+        new = df[[col_name, wgt_col_name]].copy()
+        u_field = [] if user_missings is None else list(user_missings)
+        u_wgt = [] if weight_missings is None else list(weight_missings)
+        if u_field:
+            new[col_name] = new[col_name].replace(u_field, np.nan)
+        if u_wgt:
+            new[wgt_col_name] = new[wgt_col_name].replace(u_wgt, np.nan)
+        new.dropna(inplace=True)
+        result = new.groupby(col_name)[wgt_col_name].sum().to_dict()
 
-        output={}
+        output = {}
         for val in result:
-            output[int(val)]=int(result[val])
+            k = weighted_freq_category_key(val)
+            raw = float(result[val])
+            output[k] = int(round(raw)) if abs(raw - round(raw)) < 1e-9 else raw
 
         return output
 
-    
-    def calc_weighted_mean(self, df,col_name, wgt_col_name,user_missings=list()):
-        #create a copy of df
-        new = df[[col_name,wgt_col_name]].copy()
-
-        #replace user missings with NaN
-        new[col_name]=df[col_name].replace(user_missings, np.nan)
-
-        #drop na values
-        new.dropna(subset=[col_name], inplace=True)
-
-        wdf=DescrStatsW(new[col_name],new[wgt_col_name], ddof=1)
-        return wdf.mean
-    
-    
-    def calc_weighted_mean_n_stddev(self, df,col_name, wgt_col_name,user_missings=list()):
-        #create a copy of df
-        new = df[[col_name,wgt_col_name]].copy()
-
-        #replace user missings with NaN
-        new[col_name]=df[col_name].replace(user_missings, np.nan)
-
-        #drop na values
-        #new.dropna(subset=[col_name], inplace=True)
+    def calc_weighted_mean(
+        self, df, col_name, wgt_col_name, user_missings=None, weight_missings=None
+    ):
+        new = df[[col_name, wgt_col_name]].copy()
+        u_field = [] if user_missings is None else list(user_missings)
+        u_wgt = [] if weight_missings is None else list(weight_missings)
+        if u_field:
+            new[col_name] = new[col_name].replace(u_field, np.nan)
+        if u_wgt:
+            new[wgt_col_name] = new[wgt_col_name].replace(u_wgt, np.nan)
         new.dropna(inplace=True)
 
-        wdf=DescrStatsW(new[col_name],new[wgt_col_name], ddof=1)
-        return {
-            'mean': wdf.mean,
-            'stdev': wdf.std
-        }
+        wdf = DescrStatsW(new[col_name], new[wgt_col_name], ddof=1)
+        return wdf.mean
+
+    def calc_weighted_mean_n_stddev(
+        self, df, col_name, wgt_col_name, user_missings=None, weight_missings=None
+    ):
+        new = df[[col_name, wgt_col_name]].copy()
+        u_field = [] if user_missings is None else list(user_missings)
+        u_wgt = [] if weight_missings is None else list(weight_missings)
+        if u_field:
+            new[col_name] = new[col_name].replace(u_field, np.nan)
+        if u_wgt:
+            new[wgt_col_name] = new[wgt_col_name].replace(u_wgt, np.nan)
+        new.dropna(inplace=True)
+
+        wdf = DescrStatsW(new[col_name], new[wgt_col_name], ddof=1)
+        return {"mean": wdf.mean, "stdev": wdf.std}
         
         
     
@@ -635,7 +820,9 @@ class DataDictionary:
 
 
 
-    def variable_categories_calculated(self, df,meta,variable_name, max_freq=100, user_missings=list()):
+    def variable_categories_calculated(
+        self, df,meta,variable_name, max_freq=100, user_missings=list(), categorical_list=list()
+    ):
         
         is_categorical=False
         categories=[]
@@ -650,37 +837,26 @@ class DataDictionary:
             return []
 
         #get value counts [freq] by each unique value
-        categories_calc=df[variable_name].value_counts()
+        categories_calc=merge_category_value_counts(df[variable_name].value_counts())
 
         #check if meta field has value labels - if so, treat as categorical regardless of data type
         if (variable_name in meta.variable_value_labels):
             is_categorical=True    
             categories=meta.variable_value_labels[variable_name]
         else:
-            # Only check numeric columns if no value labels exist
-            numeric_columns=df.select_dtypes(include=['int']).columns
-            
-            if (variable_name not in numeric_columns):
+            # Strict opt-in when value labels are not present.
+            if variable_name not in categorical_list:
                 return []
-
-            #guess if variable is categorical
-            #too many categories
-            if (categories_calc.count() > max_freq):
-                #not a categorical variable
-                return []
-
-            # check value data type for non-integer values
-            for cat,freq in categories_calc.items():
-                if (cat==''):
-                    continue
-                
-                if (cat!=int(cat)):
-                    return []
+            # Keep a guardrail for high-cardinality user-selected categorical fields.
+            if len(categories_calc) > 1000:
+                categories_calc = dict(
+                    sorted(categories_calc.items(), key=lambda item: item[1], reverse=True)[:1000]
+                )
 
         output=[]
 
         
-        for cat,freq in sorted(categories_calc.items()):
+        for cat,freq in sort_category_items(categories_calc.items()):
 
             is_missing=0
             if (str(cat) in user_missings):
@@ -725,9 +901,11 @@ class DataDictionary:
         return output
 
 
-    def variable_summary(self, df,meta,variable_name, user_missings=list()):
+    def variable_summary(self, df,meta,variable_name, user_missings=list(), categorical_list=list()):
         """Return a dictionary of summary statistics for a variable in a dataframe"""        
-        variable_categories=self.variable_categories_calculated(df,meta,variable_name, user_missings=user_missings)
+        variable_categories=self.variable_categories_calculated(
+            df,meta,variable_name, user_missings=user_missings, categorical_list=categorical_list
+        )
         variable_has_categories=False
 
         if (variable_categories):
