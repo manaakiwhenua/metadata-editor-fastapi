@@ -10,16 +10,20 @@ from src.DataDictionary import DataDictionary
 from src.DataDictionaryCsv import DataDictionaryCsv
 from src.ExportDatafile import ExportDatafile
 from src.routers.geospatial import router as geospatial_router
+from src.routers.timeseries import router as timeseries_router
+from src.reviewer import dispose_reviewer_job_if_needed, register_reviewer
 from src.version import get_version
 import re
 import pandas as pd
 import numpy as np
 import math
 import os
+from pathlib import Path
 #from pydantic import BaseSettings
 from pydantic_settings import BaseSettings
 import json
 from src.DictParams import DictParams
+from src.utils.dta_reader import read_dta, write_dta_to_csv
 import asyncio
 import functools
 import hashlib
@@ -36,82 +40,16 @@ from fastapi.exception_handlers import (
     request_validation_exception_handler,
 )
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from src.logging_config import install_asyncio_exception_handler, setup_logging
+from src.job_queue import enqueue_fifo_job, recover_pending_jobs
+from src.job_store import JobStore
 
-# Configure logging
-def setup_logging():
-    """Configure logging based on environment variables"""
-    # Get logging configuration from environment variables
-    log_level = os.getenv("LOG_LEVEL", "ERROR").upper()
-    log_format = os.getenv("LOG_FORMAT", "simple")
-    log_to_file = os.getenv("LOG_TO_FILE", "false").lower() == "true"
-    
-    # Generate default log file path with date-based naming
-    if log_to_file:
-        # Create logs directory if it doesn't exist
-        logs_dir = "logs"
-        if not os.path.exists(logs_dir):
-            os.makedirs(logs_dir)
-        
-        # Generate date-based filename
-        from datetime import datetime
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        default_log_file = os.path.join(logs_dir, f"error-{current_date}.log")
-    else:
-        default_log_file = "app.log"  # Fallback for when file logging is disabled
-    
-    log_file_path = os.getenv("LOG_FILE_PATH", default_log_file)
-    
-    # Convert string log level to logging constant
-    level_map = {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "ERROR": logging.ERROR,
-        "CRITICAL": logging.CRITICAL
-    }
-    
-    log_level_constant = level_map.get(log_level, logging.ERROR)
-    
-    # Define log formats
-    formats = {
-        "simple": "%(levelname)s - %(message)s",
-        "detailed": "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
-        "timestamp": "%(asctime)s - %(levelname)s - %(message)s",
-        "minimal": "%(levelname)s: %(message)s"
-    }
-    
-    log_format_string = formats.get(log_format, formats["simple"])
-    
-    # Configure logging
-    if log_to_file:
-        # Ensure the directory for the log file exists
-        log_dir = os.path.dirname(log_file_path)
-        if log_dir and not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-            
-        logging.basicConfig(
-            level=log_level_constant,
-            format=log_format_string,
-            handlers=[
-                logging.FileHandler(log_file_path),
-                logging.StreamHandler()  # Also log to console
-            ]
-        )
-        print(f"Logging configured: Level={log_level}, Format={log_format}, File={log_file_path}")
-    else:
-        logging.basicConfig(
-            level=log_level_constant,
-            format=log_format_string
-        )
-        print(f"Logging configured: Level={log_level}, Format={log_format}")
-    
-    return logging.getLogger(__name__)
-
-# Load environment variables from the .env file
-load_dotenv(override=True)
+# Load environment variables from files next to this module (stable regardless of cwd)
+_PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 # Setup logging with configuration (after loading environment variables)
-logger = setup_logging()
+logger = setup_logging(_PROJECT_ROOT)
 
 # Cleanup configuration
 # run cleanup task to remove old jobs
@@ -122,16 +60,12 @@ MAX_JOB_AGE_HOURS = int(os.getenv("MAX_JOB_AGE_HOURS", "24"))
 # limit the number of jobs in memory
 MAX_MEMORY_JOBS = int(os.getenv("MAX_MEMORY_JOBS", "500"))
 
-storage_path = os.getenv("STORAGE_PATH")
-if storage_path is not None:
-    if not os.path.exists(storage_path):
-        raise ValueError("STORAGE_PATH does not exist: " + storage_path)
-    else:
-        print("STORAGE_PATH:", storage_path)
-else:
-    print("STORAGE_PATH not set - path validation disabled")
-
-
+from src.utils.path_security import (
+    resolve_safe_path,
+    resolve_safe_paths,
+    resolve_safe_path_http,
+    resolve_safe_paths_http,
+)
 
 #class Settings(BaseSettings):
 #    storage_path: str = "data"    
@@ -187,9 +121,13 @@ app = FastAPI()
 app.fifo_queue = asyncio.Queue()
 
 app.jobs = {}
+app.job_store = JobStore()
 
 # Include geospatial router
 app.include_router(geospatial_router)
+# Include timeseries router
+app.include_router(timeseries_router)
+register_reviewer(app, _PROJECT_ROOT)
 
 # Cleanup metrics
 class CleanupMetrics:
@@ -204,11 +142,28 @@ cleanup_metrics = CleanupMetrics()
 
 @app.exception_handler(StarletteHTTPException)
 async def custom_http_exception_handler(request, exc):
-
-    import traceback
-    print(traceback.format_exc())   
-    print(f"error: {repr(exc)}")
+    if exc.status_code >= 500:
+        logger.error(
+            "HTTP %s %s: %s",
+            request.method,
+            request.url.path,
+            exc.detail,
+            exc_info=True,
+        )
+    else:
+        logger.debug(
+            "HTTP %s %s: %s",
+            request.method,
+            request.url.path,
+            exc.detail,
+        )
     return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 
@@ -231,30 +186,32 @@ async def version():
 
 @app.post("/metadata")
 async def metadata(fileinfo: FileInfo):
-
+    file_path = resolve_safe_path_http(fileinfo.file_path, label="file_path")
     datadict=DataDictionary()
-    return datadict.get_metadata(fileinfo)
+    return datadict.get_metadata(fileinfo.model_copy(update={"file_path": file_path}))
 
 @app.post("/name-labels")
 async def name_labels(fileinfo: FileInfo):
-
+    file_path = resolve_safe_path_http(fileinfo.file_path, label="file_path")
     datadict=DataDictionary()
-    return datadict.get_name_labels(fileinfo)
+    return datadict.get_name_labels(fileinfo.model_copy(update={"file_path": file_path}))
 
 
 
 @app.post("/data-dictionary")
 async def data_dictionary(fileinfo: FileInfo):
-
+    file_path = resolve_safe_path_http(fileinfo.file_path, label="file_path")
     datadict=DataDictionary()
-    return datadict.get_data_dictionary(fileinfo)
+    return datadict.get_data_dictionary(fileinfo.model_copy(update={"file_path": file_path}))
     
 
 
 @app.post("/data-dictionary-variable")
 async def data_dictionary_variable(params: DictParams):
+    file_path = resolve_safe_path_http(params.file_path, label="file_path")
+    params = params.model_copy(update={"file_path": file_path})
 
-    file_ext=os.path.splitext(params.file_path)[1]
+    file_ext=os.path.splitext(file_path)[1]
 
     if file_ext.lower() == '.csv':
         datadict=DataDictionaryCsv()
@@ -267,7 +224,10 @@ async def data_dictionary_variable(params: DictParams):
 
 @app.post("/generate-csv")
 async def write_csv(fileinfo: FileInfo):
-    return write_csv_file(fileinfo)
+    try:
+        return write_csv_file(fileinfo)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     
 
 
@@ -284,51 +244,21 @@ def convert_mixed_column(series):
     return series.apply(try_convert)
 
 def write_csv_file(fileinfo: FileInfo):
-    
-    # Check if the file path is safe
-    if not is_safe_path(fileinfo.file_path):
-        raise HTTPException(status_code=400, detail="Invalid file path: " + fileinfo.file_path)
+    file_path = resolve_safe_path(fileinfo.file_path)
+    fileinfo = fileinfo.model_copy(update={"file_path": file_path})
 
-
-    file_ext=os.path.splitext(fileinfo.file_path)[1]
-    folder_path=os.path.dirname(fileinfo.file_path)
+    file_ext=os.path.splitext(file_path)[1]
+    folder_path=os.path.dirname(file_path)
 
 
     try:
 
         if file_ext.lower() == '.dta':
-            # Try multiple encodings for robust file reading
-            encodings_to_try = [None, "utf-8", "latin1", "cp1252", "iso-8859-1", "cp850"]
-            df, meta = None, None
-            last_error = None
-            
-            for encoding in encodings_to_try:
-                try:
-                    print(f"Trying to read DTA file with encoding: {encoding}")
-                    df, meta = pyreadstat.read_dta(fileinfo.file_path, encoding=encoding, user_missing=True)
-                    print(f"Successfully read DTA file with encoding: {encoding}")
-                    break
-                except (pyreadstat.ReadstatError, UnicodeDecodeError, ValueError) as e:
-                    print(f"Failed to read with encoding {encoding}: {str(e)}")
-                    last_error = e
-                    continue
-            
-            # If all encodings failed, try without user_missing=True as fallback
-            if df is None:
-                print("All encodings failed with user_missing=True, trying without user_missing...")
-                for encoding in encodings_to_try:
-                    try:
-                        print(f"Trying to read DTA file with encoding: {encoding} (user_missing=False)")
-                        df, meta = pyreadstat.read_dta(fileinfo.file_path, encoding=encoding, user_missing=False)
-                        print(f"Successfully read DTA file with encoding: {encoding} (user_missing=False)")
-                        break
-                    except (pyreadstat.ReadstatError, UnicodeDecodeError, ValueError) as e:
-                        print(f"Failed to read with encoding {encoding} (user_missing=False): {str(e)}")
-                        last_error = e
-                        continue
-            
-            if df is None:
-                raise Exception(f"Failed to read DTA file with any encoding. Last error: {str(last_error)}")                
+            csv_filepath = os.path.join(
+                folder_path,
+                os.path.splitext(os.path.basename(fileinfo.file_path))[0] + '.csv',
+            )
+            write_dta_to_csv(fileinfo.file_path, csv_filepath, user_missing=True)
 
         elif file_ext == '.sav':
             # Try multiple encodings for robust SAV file reading
@@ -338,49 +268,47 @@ def write_csv_file(fileinfo: FileInfo):
             
             for encoding in encodings_to_try:
                 try:
-                    print(f"Trying to read SAV file with encoding: {encoding}")
+                    logger.debug("Trying to read SAV file with encoding: %s", encoding)
                     df, meta = pyreadstat.read_sav(fileinfo.file_path, encoding=encoding, user_missing=True)
-                    print(f"Successfully read SAV file with encoding: {encoding}")
+                    logger.debug("Successfully read SAV file with encoding: %s", encoding)
                     break
                 except (pyreadstat.ReadstatError, UnicodeDecodeError, ValueError) as e:
-                    print(f"Failed to read SAV with encoding {encoding}: {str(e)}")
+                    logger.debug("Failed to read SAV with encoding %s: %s", encoding, e)
                     last_error = e
                     continue
             
             # If all encodings failed, try without user_missing=True as fallback
             if df is None:
-                print("All encodings failed with user_missing=True, trying without user_missing...")
+                logger.debug("All encodings failed with user_missing=True, trying without user_missing...")
                 for encoding in encodings_to_try:
                     try:
-                        print(f"Trying to read SAV file with encoding: {encoding} (user_missing=False)")
+                        logger.debug("Trying to read SAV file with encoding: %s (user_missing=False)", encoding)
                         df, meta = pyreadstat.read_sav(fileinfo.file_path, encoding=encoding, user_missing=False)
-                        print(f"Successfully read SAV file with encoding: {encoding} (user_missing=False)")
+                        logger.debug("Successfully read SAV file with encoding: %s (user_missing=False)", encoding)
                         break
                     except (pyreadstat.ReadstatError, UnicodeDecodeError, ValueError) as e:
-                        print(f"Failed to read SAV with encoding {encoding} (user_missing=False): {str(e)}")
+                        logger.debug("Failed to read SAV with encoding %s (user_missing=False): %s", encoding, e)
                         last_error = e
                         continue
             
             if df is None:
                 raise Exception(f"Failed to read SAV file with any encoding. Last error: {str(last_error)}")
+
+            # CSV has no types; to_csv stringifies values as read from pyreadstat.
+            # convert_dtypes / convert_mixed_column are for Stata/SPSS re-export, not CSV.
+            # df = df.convert_dtypes()
+            # for col in df.columns:
+            #     if col in meta.missing_user_values:
+            #         df[col] = convert_mixed_column(df[col])
+            #         print(f"Converted mixed column: {col}", df[col].dtype)
+
+            csv_filepath = os.path.join(
+                folder_path,
+                os.path.splitext(os.path.basename(fileinfo.file_path))[0] + '.csv',
+            )
+            df.to_csv(csv_filepath, index=False)
         else:
             return {"error": "file not supported" + file_ext}
-    
-
-        df=df.convert_dtypes()
-
-        # Convert mixed columns to numeric if they contain user-defined missings
-        for col in df.columns:
-            #check  meta for user-defined missings
-            if col in meta.missing_user_values:
-                #convert mixed columns to numeric
-                df[col] = convert_mixed_column(df[col])
-                print(f"Converted mixed column: {col}", df[col].dtype)
-                continue
-
-
-        csv_filepath = os.path.join(folder_path,os.path.splitext(os.path.basename(fileinfo.file_path))[0] + '.csv')    
-        df.to_csv(csv_filepath, index=False)
 
     except Exception as e:
         raise HTTPException(status_code=400, detail="error writing csv file: " + str(e))
@@ -399,36 +327,34 @@ def remove_columns_from_csv(params: RemoveColumnsParams) -> Dict[str, Any]:
     Read a CSV, drop the given columns, and write to output_path.
     If output_path already exists, it is overwritten. Caller is responsible for replacing the original file if desired.
     """
-    if not is_safe_path(params.file_path):
-        raise ValueError("Invalid file path: " + params.file_path)
-    if not is_safe_path(params.output_path):
-        raise ValueError("Invalid output path: " + params.output_path)
-    if not os.path.exists(params.file_path):
-        raise FileNotFoundError("File not found: " + params.file_path)
+    file_path, output_path = resolve_safe_paths(params.file_path, params.output_path, label="file_path")
+    params = params.model_copy(update={"file_path": file_path, "output_path": output_path})
+    if not os.path.exists(file_path):
+        raise FileNotFoundError("File not found: " + file_path)
 
-    file_ext = os.path.splitext(params.file_path)[1].lower()
+    file_ext = os.path.splitext(file_path)[1].lower()
     if file_ext != ".csv":
-        raise ValueError("Source file must be a CSV: " + params.file_path)
+        raise ValueError("Source file must be a CSV: " + file_path)
 
-    output_dir = os.path.dirname(params.output_path)
+    output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    df = pd.read_csv(params.file_path)
+    df = pd.read_csv(file_path)
     original_columns = list(df.columns)
     # Drop only columns that exist; ignore missing names
     to_drop = [c for c in params.column_names if c in df.columns]
     df = df.drop(columns=to_drop, errors="ignore")
-    df.to_csv(params.output_path, index=False)
+    df.to_csv(output_path, index=False)
 
     return {
         "status": "success",
-        "output_path": params.output_path,
+        "output_path": output_path,
         "rows": len(df),
         "columns_remaining": len(df.columns),
         "columns_removed": to_drop,
         "columns_requested_not_found": [c for c in params.column_names if c not in original_columns],
-        "output_file_size": DataUtils.sizeof_fmt(os.path.getsize(params.output_path)),
+        "output_file_size": DataUtils.sizeof_fmt(os.path.getsize(output_path)),
     }
 
 
@@ -459,30 +385,34 @@ def sanitize_jsonable(obj):
 
 
 async def fifo_worker():
-    print("Starting FIFO worker")
+    logger.debug("Starting FIFO worker")
 
-    # remove old jobs
-    remove_jobs_folder()
+    await recover_pending_jobs(app)
 
     while True:
         job = await app.fifo_queue.get()
-        print(f"Got a job: (size of remaining queue: {app.fifo_queue.qsize()})")
-        await job()
+        logger.debug("FIFO worker dequeuing (remaining=%s)", app.fifo_queue.qsize())
+        try:
+            await job()
+        except Exception:
+            logger.exception("Unhandled exception in background job")
 
 
 async def periodic_cleanup_worker():
     """Background task to clean up old jobs every few hours"""
-    print(f"Starting periodic cleanup worker - will run every {CLEANUP_INTERVAL_HOURS} hours")
-    
+    logger.debug(
+        "Starting periodic cleanup worker - will run every %s hours",
+        CLEANUP_INTERVAL_HOURS,
+    )
+
     while True:
         await asyncio.sleep(3600 * CLEANUP_INTERVAL_HOURS)
         try:
-            print("Running periodic job cleanup...")
+            logger.debug("Running periodic job cleanup...")
             await cleanup_old_jobs()
-        except Exception as e:
-            print(f"Cleanup error: {e}")
-            import traceback
-            print(traceback.format_exc())
+        except Exception:
+            logger.exception("Cleanup error")
+
 
 
 async def cleanup_old_jobs():
@@ -495,13 +425,14 @@ async def cleanup_old_jobs():
     # Cleanup policies by job status
     cleanup_policies = {
         "queued": {"max_age_hours": 2},       # Remove stuck queued jobs after 2 hours
+        "waiting": {"max_age_hours": 2},      # Reviewer jobs waiting on semaphore
         "processing": {"max_age_hours": 8},   # Remove stuck processing jobs after 8 hours  
         "done": {"max_age_hours": MAX_JOB_AGE_HOURS},        # Keep completed jobs for configured time
         "error": {"max_age_hours": MAX_JOB_AGE_HOURS * 2},    # Keep error jobs longer for debugging
         "cancelled": {"max_age_hours": 1}     # Remove cancelled jobs after 1 hour
     }
     
-    print(f"Starting cleanup - current job count: {len(app.jobs)}")
+    logger.debug("Starting cleanup - current job count: %s", len(app.jobs))
     
     # Find jobs to remove based on age and status
     for jobid, job in app.jobs.items():
@@ -522,27 +453,35 @@ async def cleanup_old_jobs():
                 max_age = cleanup_policies[job_status]["max_age_hours"]
                 if age_hours > max_age:
                     jobs_to_remove.append(jobid)
-                    print(f"Marking job {jobid} for removal - status: {job_status}, age: {age_hours:.2f}h")
-            
+                    logger.debug(
+                        "Marking job %s for removal - status: %s, age: %.2fh",
+                        jobid,
+                        job_status,
+                        age_hours,
+                    )
+
         except Exception as e:
-            print(f"Error processing job {jobid} during cleanup: {e}")
+            logger.error("Error processing job %s during cleanup: %s", jobid, e)
             # If we can't process the job metadata, remove it if it's old enough
             jobs_to_remove.append(jobid)
     
     # Remove jobs from memory and corresponding files
     for jobid in jobs_to_remove:
         try:
+            job = app.jobs.get(jobid, {})
+            dispose_reviewer_job_if_needed(app, jobid, job)
             # Remove job file if it exists
             file_path = os.path.join('jobs', f'{jobid}.json')
             if os.path.exists(file_path):
                 os.remove(file_path)
                 files_removed += 1
             
-            # Remove from memory
+            # Remove from memory and durable store
             del app.jobs[jobid]
-            
+            app.job_store.delete_job(jobid)
+
         except Exception as e:
-            print(f"Error removing job {jobid}: {e}")
+            logger.error("Error removing job %s: %s", jobid, e)
     
     # Enforce memory limits (LRU-style cleanup)
     if len(app.jobs) > MAX_MEMORY_JOBS:
@@ -558,8 +497,13 @@ async def cleanup_old_jobs():
     cleanup_metrics.files_removed_total += files_removed
     cleanup_metrics.cleanup_duration_seconds = cleanup_duration
     
-    print(f"Cleanup completed - removed {len(jobs_to_remove)} jobs, {files_removed} files in {cleanup_duration:.2f}s")
-    print(f"Remaining job count: {len(app.jobs)}")
+    logger.debug(
+        "Cleanup completed - removed %s jobs, %s files in %.2fs",
+        len(jobs_to_remove),
+        files_removed,
+        cleanup_duration,
+    )
+    logger.debug("Remaining job count: %s", len(app.jobs))
 
 
 async def enforce_memory_limits(already_removing):
@@ -579,8 +523,8 @@ async def enforce_memory_limits(already_removing):
         
         if job["status"] == "processing":
             priority = 1  # highest priority - never remove processing jobs
-        elif job["status"] == "queued":
-            priority = 2  # high priority - keep queued jobs
+        elif job["status"] in ("queued", "waiting"):
+            priority = 2  # high priority - keep queued / waiting jobs
         elif job["status"] == "error":
             priority = 4  # lower priority for error jobs
         else:  # done
@@ -608,12 +552,14 @@ async def enforce_memory_limits(already_removing):
     for priority, timestamp, jobid in jobs_with_priority:
         if len(jobs_to_remove_for_memory) >= target_removal_count:
             break
-        if priority > 2:  # Don't remove processing or queued jobs for memory limits
+        if priority > 2:  # Don't remove processing, queued, or waiting jobs for memory limits
             jobs_to_remove_for_memory.append(jobid)
     
     # Remove the selected jobs
     for jobid in jobs_to_remove_for_memory:
         try:
+            job = app.jobs.get(jobid, {})
+            dispose_reviewer_job_if_needed(app, jobid, job)
             # Remove job file if it exists
             file_path = os.path.join('jobs', f'{jobid}.json')
             if os.path.exists(file_path):
@@ -624,10 +570,10 @@ async def enforce_memory_limits(already_removing):
             cleanup_metrics.jobs_cleaned_total += 1
             
         except Exception as e:
-            print(f"Error removing job {jobid} for memory limit: {e}")
-    
+            logger.error("Error removing job %s for memory limit: %s", jobid, e)
+
     if jobs_to_remove_for_memory:
-        print(f"Removed {len(jobs_to_remove_for_memory)} jobs to enforce memory limit")
+        logger.debug("Removed %s jobs to enforce memory limit", len(jobs_to_remove_for_memory))
 
 
 async def cleanup_orphaned_files():
@@ -644,7 +590,7 @@ async def cleanup_orphaned_files():
             filename = os.path.basename(file_path)
             jobid = filename[:-5]  # Remove .json extension
             
-            if jobid not in app.jobs:
+            if jobid not in app.jobs and app.job_store.get_job(jobid) is None:
                 orphaned_files.append(file_path)
         
         # Remove orphaned files
@@ -653,13 +599,13 @@ async def cleanup_orphaned_files():
                 os.remove(file_path)
                 cleanup_metrics.files_removed_total += 1
             except Exception as e:
-                print(f"Error removing orphaned file {file_path}: {e}")
-        
+                logger.error("Error removing orphaned file %s: %s", file_path, e)
+
         if orphaned_files:
-            print(f"Removed {len(orphaned_files)} orphaned job files")
-            
+            logger.debug("Removed %s orphaned job files", len(orphaned_files))
+
     except Exception as e:
-        print(f"Error during orphaned file cleanup: {e}")
+        logger.error("Error during orphaned file cleanup: %s", e)
 
 
 
@@ -667,12 +613,25 @@ async def cleanup_orphaned_files():
 
 @app.on_event("startup")
 async def start_background_tasks():
+    install_asyncio_exception_handler()
+    logger.info(
+        "Application starting pid=%s version=%s",
+        os.getpid(),
+        get_version(),
+    )
     asyncio.create_task(fifo_worker())
-    asyncio.create_task(periodic_cleanup_worker())        
+    asyncio.create_task(periodic_cleanup_worker())
+
+
+@app.on_event("shutdown")
+async def shutdown_tasks():
+    logger.info("Application shutting down gracefully")
 
 
 @app.post("/data-dictionary-queue")
-async def data_dictionary_queue(params: DictParams):    
+async def data_dictionary_queue(params: DictParams):
+    file_path = resolve_safe_path_http(params.file_path, label="file_path")
+    params = params.model_copy(update={"file_path": file_path})
     jobid='job-' + str(time.time())
     current_time = datetime.datetime.now().isoformat()
     app.jobs[jobid]={
@@ -686,7 +645,7 @@ async def data_dictionary_queue(params: DictParams):
         }
     
     data_dict_callback = functools.partial(write_data_dictionary_file, jobid, params)
-    await app.fifo_queue.put( data_dict_callback )
+    await enqueue_fifo_job(app, jobid, data_dict_callback)
 
     return JSONResponse(status_code=202, content={
         "message": "Item is queued",
@@ -711,7 +670,7 @@ async def write_csv_queue(fileinfo: FileInfo):
         }
     
     generate_csv_callback=functools.partial(write_csv_file_callback, jobid, fileinfo)
-    await app.fifo_queue.put( generate_csv_callback )
+    await enqueue_fifo_job(app, jobid, generate_csv_callback)
 
     return JSONResponse(status_code=202, content={
         "message": "file is queued",
@@ -727,7 +686,7 @@ async def write_csv_file_callback(jobid, fileinfo: FileInfo):
     try:
         result=await loop.run_in_executor(None, write_csv_file, fileinfo)
     except Exception as e:
-        print ("exception writing csv file", e)        
+        logger.exception("Exception writing csv file for job %s", jobid)
         app.jobs[jobid]["status"]="error"
         app.jobs[jobid]["error"]="failed to write csv file: " + str(e)
         app.jobs[jobid]["completed_at"] = datetime.datetime.now().isoformat()
@@ -746,14 +705,12 @@ async def write_csv_file_callback(jobid, fileinfo: FileInfo):
 @app.post("/remove-csv-columns-queue")
 async def remove_csv_columns_queue(params: RemoveColumnsParams):
     """Queue a job to remove specified columns from a CSV and write the result to a new file. If output_path exists, it is overwritten."""
-    if not is_safe_path(params.file_path):
-        raise HTTPException(status_code=400, detail="Invalid file path: " + params.file_path)
-    if not is_safe_path(params.output_path):
-        raise HTTPException(status_code=400, detail="Invalid output path: " + params.output_path)
-    if not os.path.exists(params.file_path):
-        raise HTTPException(status_code=404, detail="File not found: " + params.file_path)
-    if os.path.splitext(params.file_path)[1].lower() != ".csv":
-        raise HTTPException(status_code=400, detail="Source file must be a CSV: " + params.file_path)
+    file_path, output_path = resolve_safe_paths_http(params.file_path, params.output_path, label="file_path")
+    params = params.model_copy(update={"file_path": file_path, "output_path": output_path})
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found: " + file_path)
+    if os.path.splitext(file_path)[1].lower() != ".csv":
+        raise HTTPException(status_code=400, detail="Source file must be a CSV: " + file_path)
 
     jobid = "job-" + str(time.time())
     current_time = datetime.datetime.now().isoformat()
@@ -767,7 +724,7 @@ async def remove_csv_columns_queue(params: RemoveColumnsParams):
         "info": params.model_dump(),
     }
     callback = functools.partial(remove_columns_from_csv_callback, jobid, params)
-    await app.fifo_queue.put(callback)
+    await enqueue_fifo_job(app, jobid, callback)
 
     return JSONResponse(status_code=202, content={
         "message": "Remove CSV columns job is queued",
@@ -796,8 +753,10 @@ async def remove_columns_from_csv_callback(jobid, params: RemoveColumnsParams):
     
 
 async def write_data_dictionary_file(jobid, params: DictParams):
+    file_path = resolve_safe_path(params.file_path)
+    params = params.model_copy(update={"file_path": file_path})
     loop = asyncio.get_running_loop()
-    file_ext=os.path.splitext(params.file_path)[1]
+    file_ext=os.path.splitext(file_path)[1]
 
     if file_ext.lower() == '.csv':
         datadict=DataDictionaryCsv()
@@ -816,18 +775,28 @@ async def write_data_dictionary_file(jobid, params: DictParams):
             json.dump(result, outfile)
         
         return {"status": "success", "file_path": file_path}
-    
-    except Exception as e:
-        import traceback
+
+    except HTTPException as e:
         app.jobs[jobid]["status"]="error"
-        app.jobs[jobid]["error"]=str(e)
+        detail = e.detail
+        err_msg = detail if isinstance(detail, str) else str(detail)
+        app.jobs[jobid]["error"] = err_msg
         app.jobs[jobid]["completed_at"] = datetime.datetime.now().isoformat()
-        app.jobs[jobid]["traceback"]=traceback.format_exc()
+        app.jobs[jobid]["traceback"] = traceback.format_exc()
+        return {"status": "error", "error": err_msg}
+
+    except Exception as e:
+        app.jobs[jobid]["status"]="error"
+        app.jobs[jobid]["error"] = str(e)
+        app.jobs[jobid]["completed_at"] = datetime.datetime.now().isoformat()
+        app.jobs[jobid]["traceback"] = traceback.format_exc()
         return {"status": "error", "error": str(e)}
 
 
 @app.post("/export-data-queue")
 async def export_data_queue(params: DictParams):
+    file_path = resolve_safe_path_http(params.file_path, label="file_path")
+    params = params.model_copy(update={"file_path": file_path})
     #print ("export_data_queue", params)
     jobid='job-' + str(time.time())
     current_time = datetime.datetime.now().isoformat()
@@ -842,7 +811,7 @@ async def export_data_queue(params: DictParams):
         }
     
     data_export_callback = functools.partial(export_data_file, jobid, params)
-    await app.fifo_queue.put( data_export_callback )
+    await enqueue_fifo_job(app, jobid, data_export_callback)
 
     return JSONResponse(status_code=202, content={
         "message": "Item is queued",
@@ -853,6 +822,8 @@ async def export_data_queue(params: DictParams):
 @app.post("/process-microdata-queue")
 async def process_microdata_queue(params: DataProcessingParams):
     """Unified endpoint to process microdata files (CSV generation + data dictionary)"""
+    file_path = resolve_safe_path_http(params.file_path, label="file_path")
+    params = params.model_copy(update={"file_path": file_path})
     jobid='job-' + str(time.time())
     current_time = datetime.datetime.now().isoformat()
     app.jobs[jobid]={
@@ -866,7 +837,7 @@ async def process_microdata_queue(params: DataProcessingParams):
         }
     
     process_microdata_callback = functools.partial(process_microdata_file, jobid, params)
-    await app.fifo_queue.put( process_microdata_callback )
+    await enqueue_fifo_job(app, jobid, process_microdata_callback)
 
     return JSONResponse(status_code=202, content={
         "message": "Microdata processing is queued",
@@ -875,14 +846,21 @@ async def process_microdata_queue(params: DataProcessingParams):
 
 
 async def export_data_file(jobid, params: DictParams):
+    file_path = resolve_safe_path(params.file_path)
+    params = params.model_copy(update={"file_path": file_path})
     loop = asyncio.get_running_loop()
-    file_ext=os.path.splitext(params.file_path)[1]
+    file_ext=os.path.splitext(file_path)[1]
 
     exportDF=ExportDatafile()    
     app.jobs[jobid]["status"]="processing"
 
     try:
-        # Debug logging (only shown when LOG_LEVEL=DEBUG)
+        logger.info(
+            "Export job processing: jobid=%s file=%s format=%s",
+            jobid,
+            params.file_path,
+            params.export_format,
+        )
         logger.debug(f"Starting export for job {jobid} with params: {params}")
         
         result=await loop.run_in_executor(None, exportDF.export_file, params)
@@ -911,6 +889,7 @@ async def export_data_file(jobid, params: DictParams):
                 "dtypes": params.dtypes,
                 "value_labels": params.value_labels,
                 "export_format": params.export_format,
+                "export_options": params.export_options,
             },
         }
 
@@ -934,6 +913,8 @@ async def export_data_file(jobid, params: DictParams):
 
 async def process_microdata_file(jobid, params: DataProcessingParams):
     """Process microdata file with both CSV generation and data dictionary creation"""
+    file_path = resolve_safe_path(params.file_path)
+    params = params.model_copy(update={"file_path": file_path})
     loop = asyncio.get_running_loop()
     app.jobs[jobid]["status"] = "processing"
     
@@ -1004,6 +985,13 @@ async def process_microdata_file(jobid, params: DataProcessingParams):
                 
                 logger.debug(f"Job {jobid}: Data dictionary generation completed")
                 
+            except HTTPException as e:
+                detail = e.detail
+                err_detail = detail if isinstance(detail, str) else str(detail)
+                error_msg = f"Data dictionary generation failed: {err_detail}"
+                logger.error(f"Job {jobid}: {error_msg}")
+                results["data_dictionary"] = {"status": "error", "error": error_msg}
+                results["processing_steps"].append("data_dictionary_failed")
             except Exception as e:
                 error_msg = f"Data dictionary generation failed: {str(e)}"
                 logger.error(f"Job {jobid}: {error_msg}")
@@ -1079,13 +1067,14 @@ async def cleanup_status():
         "current_status": {
             "job_count": len(app.jobs),
             "queue_size": app.fifo_queue.qsize(),
+            "queued_in_store": app.job_store.count_by_status("queued"),
             "max_memory_jobs": MAX_MEMORY_JOBS,
             "max_job_age_hours": MAX_JOB_AGE_HOURS,
             "cleanup_interval_hours": CLEANUP_INTERVAL_HOURS
         },
         "job_status_breakdown": {
             status: len([job for job in app.jobs.values() if job["status"] == status])
-            for status in ["queued", "processing", "done", "error", "cancelled"]
+            for status in ["queued", "waiting", "processing", "done", "error", "cancelled"]
         }
     }
 
@@ -1100,15 +1089,23 @@ async def manual_cleanup():
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
 
 
+def _get_job_record(jobid: str) -> dict | None:
+    if jobid in app.jobs:
+        return app.jobs[jobid]
+    stored = app.job_store.get_job(jobid)
+    if stored:
+        app.jobs[jobid] = stored
+    return stored
+
+
 @app.get("/jobs/{jobid}")
 async def queue_items(jobid: str):
-
-    if jobid in app.jobs:
-        job = app.jobs[jobid]
-        
+    job = _get_job_record(jobid)
+    if job:
         # Update last_accessed timestamp
         job["last_accessed"] = datetime.datetime.now().isoformat()
-        
+        app.job_store.update_status(jobid, job["status"], touch_accessed=True)
+
         if (job["status"]=="done"):
             data={}
             file_path=os.path.join('jobs', str(jobid) + '.json')
@@ -1122,7 +1119,7 @@ async def queue_items(jobid: str):
             job_response['data'] = sanitize_jsonable(data)
             return job_response
         elif (job["status"]=="error"):
-            print ("job error", job)
+            logger.debug("Job error response for %s: %s", jobid, job.get("error"))
             # Include detailed error information if available
             if 'error_details' in job:
                 error_detail = f"{job['error']}\n\nDetailed Error Information:\n{json.dumps(job['error_details'], indent=2)}"
@@ -1132,7 +1129,7 @@ async def queue_items(jobid: str):
         else:
             return sanitize_jsonable(job)
 
-    raise HTTPException(status_code=404, detail="Job not found") 
+    raise HTTPException(status_code=404, detail="Job not found")
 
 
 @app.delete("/jobs/{jobid}")
@@ -1146,12 +1143,37 @@ async def cancel_job(jobid: str):
     Returns:
         Success message with cancellation details
     """
-    if jobid not in app.jobs:
+    job = _get_job_record(jobid)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = app.jobs[jobid]
+
     status = job["status"]
     current_time = datetime.datetime.now().isoformat()
+
+    # Metadata reviewer: cooperative cancel via threading.Event + asyncio task cancel
+    if status in ("queued", "waiting", "processing"):
+        dispose_reviewer_job_if_needed(app, jobid, job)
+        if job.get("jobtype") == "metadata-reviewer":
+            job["status"] = "cancelled"
+            job["cancelled_at"] = current_time
+            job["cancellation_reason"] = "User requested cancellation"
+            logger.info("Reviewer job %s cancelled (was %s)", jobid, status)
+            app.job_store.update_status(
+                jobid,
+                "cancelled",
+                cancelled_at=current_time,
+                cancellation_reason="User requested cancellation",
+                completed_at=current_time,
+                touch_accessed=True,
+            )
+            return {
+                "status": "success",
+                "message": f"Job {jobid} has been cancelled",
+                "job_id": jobid,
+                "previous_status": status,
+                "cancelled_at": current_time,
+                "cancellation_reason": "User requested cancellation",
+            }
     
     # Check if job can be cancelled
     if status in ["done", "error", "cancelled"]:
@@ -1170,19 +1192,28 @@ async def cancel_job(jobid: str):
         logger.info(f"Job {jobid} marked as cancelled (was processing)")
         
     elif status == "queued":
-        # Remove from queue and mark as cancelled
+        # Mark as cancelled; FIFO wrapper skips if still waiting in asyncio queue
         job["status"] = "cancelled"
         job["cancelled_at"] = current_time
         job["cancellation_reason"] = "User requested cancellation"
         logger.info(f"Job {jobid} cancelled (was queued)")
-    
+
     else:
         # Handle any other status
         job["status"] = "cancelled"
         job["cancelled_at"] = current_time
         job["cancellation_reason"] = "User requested cancellation"
         logger.info(f"Job {jobid} cancelled (was {status})")
-    
+
+    app.job_store.update_status(
+        jobid,
+        "cancelled",
+        cancelled_at=current_time,
+        cancellation_reason="User requested cancellation",
+        completed_at=current_time,
+        touch_accessed=True,
+    )
+
     return {
         "status": "success",
         "message": f"Job {jobid} has been cancelled",
@@ -1199,33 +1230,6 @@ def remove_jobs_folder():
         files = glob.glob(folder_path + '/*.json')
         for f in files:
             os.remove(f)
-
-
-
-def is_safe_path(file_path: str) -> bool:
-    """
-    Validate that the file path is within the storage directory.
-    If STORAGE_PATH is not set, path validation is disabled.
-
-    Args:
-        file_path (str): The target file path to validate.
-
-    Returns:
-        bool: True if the path is safe, False otherwise.
-    """
-    # Get the storage path from the environment variable
-    storage_path = os.getenv("STORAGE_PATH")
-
-    # If STORAGE_PATH is not set, skip path validation
-    if not storage_path:
-        return True
-
-    # Resolve and normalize paths
-    storage_path = os.path.abspath(os.path.normpath(storage_path))
-    target_path = os.path.abspath(os.path.normpath(file_path))
-
-    # Check if the target path is within the storage path
-    return target_path.startswith(storage_path)
 
 
 #if __name__ == "__main__":

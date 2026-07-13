@@ -25,6 +25,8 @@ from ..models.geospatial_models import (
     GeospatialDataExtractionJobResponse
 )
 from ..services.geospatial_service import GeospatialService
+from src.job_queue import enqueue_fifo_job
+from src.utils.path_security import resolve_safe_path, resolve_safe_paths, resolve_safe_path_http, resolve_safe_paths_http
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +96,7 @@ async def get_geospatial_layers(
         file_path: Path to the geospatial file
     """
     try:
+        file_path = resolve_safe_path_http(file_path, label="file_path")
         # Validate file path
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
@@ -123,7 +126,9 @@ async def get_geospatial_layers_queue(
     This extracts only layer information without other analysis
     """
     try:
-        # Validate file path
+        request = request.model_copy(
+            update={"file_path": resolve_safe_path_http(request.file_path, label="file_path")}
+        )
         if not os.path.exists(request.file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
         
@@ -157,11 +162,8 @@ async def get_geospatial_layers_queue(
             request
         )
         
-        # Add to the main app's FIFO queue
-        await app.fifo_queue.put(layers_callback)
-        
-        logger.info(f"Queued geospatial layers extraction job {jobid} for file: {request.file_path}")
-        
+        await enqueue_fifo_job(app, jobid, layers_callback)
+
         return GeospatialJobResponse(
             message="Geospatial layers extraction job is queued",
             job_id=jobid,
@@ -185,12 +187,17 @@ async def extract_geospatial_data_queue(
     This extracts raw data and saves it as a CSV file
     """
     try:
-        # Validate file path
-        if not os.path.exists(request.file_path):
-            raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
+        file_path, csv_output_path = resolve_safe_paths_http(
+            request.file_path, request.csv_output_path, label="file_path"
+        )
+        request = request.model_copy(
+            update={"file_path": file_path, "csv_output_path": csv_output_path}
+        )
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
         
         # Validate CSV output path
-        csv_dir = os.path.dirname(request.csv_output_path)
+        csv_dir = os.path.dirname(csv_output_path)
         if csv_dir and not os.path.exists(csv_dir):
             try:
                 os.makedirs(csv_dir, exist_ok=True)
@@ -256,11 +263,8 @@ async def extract_geospatial_data_queue(
             request
         )
         
-        # Add to the main app's FIFO queue
-        await app.fifo_queue.put(data_callback)
-        
-        logger.info(f"Queued geospatial data extraction job {jobid} for file: {request.file_path} -> {request.csv_output_path}")
-        
+        await enqueue_fifo_job(app, jobid, data_callback)
+
         return GeospatialDataExtractionJobResponse(
             message="Geospatial data extraction job is queued",
             job_id=jobid,
@@ -285,7 +289,9 @@ async def extract_geospatial_metadata_queue(
     Queue a geospatial metadata extraction job for asynchronous processing
     """
     try:
-        # Validate file path
+        request = request.model_copy(
+            update={"file_path": resolve_safe_path_http(request.file_path, label="file_path")}
+        )
         if not os.path.exists(request.file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
         
@@ -349,11 +355,8 @@ async def extract_geospatial_metadata_queue(
             request
         )
         
-        # Add to the main app's FIFO queue
-        await app.fifo_queue.put(metadata_callback)
-        
-        logger.info(f"Queued geospatial metadata extraction job {jobid} for file: {request.file_path}")
-        
+        await enqueue_fifo_job(app, jobid, metadata_callback)
+
         return GeospatialMetadataJobResponse(
             message="Geospatial metadata extraction job is queued",
             job_id=jobid,
@@ -378,7 +381,9 @@ async def extract_geospatial_metadata_batch_queue(
     Queue multiple geospatial metadata extraction jobs for batch processing
     """
     try:
-        # Validate file path
+        request = request.model_copy(
+            update={"file_path": resolve_safe_path_http(request.file_path, label="file_path")}
+        )
         if not os.path.exists(request.file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
         
@@ -448,11 +453,8 @@ async def extract_geospatial_metadata_batch_queue(
             request
         )
         
-        # Add to the main app's FIFO queue
-        await app.fifo_queue.put(batch_callback)
-        
-        logger.info(f"Queued batch geospatial metadata extraction job {batch_jobid} for file: {request.file_path}")
-        
+        await enqueue_fifo_job(app, batch_jobid, batch_callback)
+
         return GeospatialBatchJobResponse(
             message="Batch geospatial metadata extraction job is queued",
             job_id=batch_jobid,
@@ -479,7 +481,9 @@ async def process_geospatial_layers_job(jobid: str, request: GeospatialImportReq
     app.jobs[jobid]["status"] = "processing"
     
     try:
-        logger.info(f"Processing geospatial layers extraction job {jobid} for file: {request.file_path}")
+        file_path = resolve_safe_path(request.file_path)
+        request = request.model_copy(update={"file_path": file_path})
+        logger.info(f"Processing geospatial layers extraction job {jobid} for file: {file_path}")
         
         # Get basic file information to extract layers only
         file_info = await loop.run_in_executor(
@@ -538,7 +542,13 @@ async def process_geospatial_data_job(jobid: str, request: GeospatialDataExtract
     app.jobs[jobid]["status"] = "processing"
     
     try:
-        logger.info(f"Processing geospatial data extraction job {jobid} for file: {request.file_path} -> {request.csv_output_path}")
+        file_path, csv_output_path = resolve_safe_paths(
+            request.file_path, request.csv_output_path, label="file_path"
+        )
+        request = request.model_copy(
+            update={"file_path": file_path, "csv_output_path": csv_output_path}
+        )
+        logger.info(f"Processing geospatial data extraction job {jobid} for file: {file_path} -> {csv_output_path}")
         
         # Extract data and save as CSV using the service
         result = await loop.run_in_executor(
@@ -592,7 +602,9 @@ async def process_geospatial_metadata_job(jobid: str, request: GeospatialMetadat
     app.jobs[jobid]["status"] = "processing"
     
     try:
-        logger.info(f"Processing geospatial metadata extraction job {jobid} for file: {request.file_path}")
+        file_path = resolve_safe_path(request.file_path)
+        request = request.model_copy(update={"file_path": file_path})
+        logger.info(f"Processing geospatial metadata extraction job {jobid} for file: {file_path}")
         
         # Extract metadata using the service
         result = await loop.run_in_executor(
@@ -647,7 +659,9 @@ async def process_geospatial_batch_metadata_job(jobid: str, request: GeospatialB
     app.jobs[jobid]["status"] = "processing"
     
     try:
-        logger.info(f"Processing batch geospatial metadata extraction job {jobid} for file: {request.file_path}")
+        file_path = resolve_safe_path(request.file_path)
+        request = request.model_copy(update={"file_path": file_path})
+        logger.info(f"Processing batch geospatial metadata extraction job {jobid} for file: {file_path}")
         
         # Extract metadata using the service for each layer/band
         results = []
@@ -710,7 +724,9 @@ async def extract_geospatial_metadata_with_images_queue(
     WARNING: This may cause threading issues on some systems
     """
     try:
-        # Validate file path
+        request = request.model_copy(
+            update={"file_path": resolve_safe_path_http(request.file_path, label="file_path")}
+        )
         if not os.path.exists(request.file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
         
@@ -776,11 +792,8 @@ async def extract_geospatial_metadata_with_images_queue(
             request
         )
         
-        # Add to the main app's FIFO queue
-        await app.fifo_queue.put(metadata_callback)
-        
-        logger.info(f"Queued geospatial metadata extraction job with images {jobid} for file: {request.file_path}")
-        
+        await enqueue_fifo_job(app, jobid, metadata_callback)
+
         return GeospatialMetadataJobResponse(
             message="Geospatial metadata extraction job with images is queued (WARNING: May cause threading issues)",
             job_id=jobid,
@@ -807,7 +820,9 @@ async def process_geospatial_metadata_with_images_job(jobid: str, request: Geosp
     app.jobs[jobid]["status"] = "processing"
     
     try:
-        logger.info(f"Processing geospatial metadata extraction with images job {jobid} for file: {request.file_path}")
+        file_path = resolve_safe_path(request.file_path)
+        request = request.model_copy(update={"file_path": file_path})
+        logger.info(f"Processing geospatial metadata extraction with images job {jobid} for file: {file_path}")
         
         # Extract metadata using the service with images enabled
         result = await loop.run_in_executor(
@@ -862,7 +877,9 @@ async def get_geospatial_bounding_box(
     Get bounding box for a geospatial file in WGS84 coordinates
     """
     try:
-        # Validate file path
+        request = request.model_copy(
+            update={"file_path": resolve_safe_path_http(request.file_path, label="file_path")}
+        )
         if not os.path.exists(request.file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
         
@@ -889,7 +906,9 @@ async def enrich_geospatial_file(
     Enrich a geospatial file with additional metadata and analytics
     """
     try:
-        # Validate file path
+        request = request.model_copy(
+            update={"file_path": resolve_safe_path_http(request.file_path, label="file_path")}
+        )
         if not os.path.exists(request.file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
         
@@ -922,7 +941,9 @@ async def get_comprehensive_metadata(
     Get comprehensive metadata including file info, bounding box, and analytics
     """
     try:
-        # Validate file path
+        request = request.model_copy(
+            update={"file_path": resolve_safe_path_http(request.file_path, label="file_path")}
+        )
         if not os.path.exists(request.file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
         
@@ -949,7 +970,9 @@ async def validate_geospatial_file(
     Validate if a file is a supported geospatial format
     """
     try:
-        # Validate file path
+        request = request.model_copy(
+            update={"file_path": resolve_safe_path_http(request.file_path, label="file_path")}
+        )
         if not os.path.exists(request.file_path):
             raise HTTPException(status_code=404, detail=f"File not found: {request.file_path}")
         
@@ -997,6 +1020,7 @@ async def enrich_geospatial_file_queue(
     Queue a request to enrich a geospatial file (for long-running operations)
     """
     try:
+        resolve_safe_path_http(request.file_path, label="file_path")
         # Generate job ID
         jobid = f'geospatial-enrich-{int(time.time())}'
         current_time = datetime.datetime.now().isoformat()
@@ -1034,6 +1058,7 @@ async def transform_coordinate_system(
     """
     Transform coordinate system of a geospatial file
     """
+    resolve_safe_path_http(request.file_path, label="file_path")
     # TODO: Implement coordinate system transformation
     raise HTTPException(status_code=501, detail="Coordinate system transformation not yet implemented")
 
@@ -1046,6 +1071,7 @@ async def clip_geospatial_data(
     """
     Clip geospatial data using a geometry
     """
+    resolve_safe_path_http(request.file_path, label="file_path")
     # TODO: Implement spatial clipping
     raise HTTPException(status_code=501, detail="Spatial clipping not yet implemented")
 
@@ -1058,5 +1084,6 @@ async def generate_preview(
     """
     Generate preview image of geospatial data
     """
+    resolve_safe_path_http(request.file_path, label="file_path")
     # TODO: Implement preview generation
     raise HTTPException(status_code=501, detail="Preview generation not yet implemented")

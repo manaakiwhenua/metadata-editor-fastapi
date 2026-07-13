@@ -1,6 +1,6 @@
 # Metadata Editor – FastAPI Backend Service
 
-A FastAPI-based RESTful service that processes data files (Stata, SPSS, CSV) to support the [Metadata Editor](https://github.com/worldbank/metadata-editor).
+A FastAPI-based RESTful service that processes data files (Stata, SPSS, CSV) to support the [Metadata Editor](https://github.com/worldbank/metadata-editor). It is designed to run on the same machine as the Metadata Editor and is not intended for public internet exposure.
 
 ## ✨ Features
 
@@ -11,165 +11,249 @@ A FastAPI-based RESTful service that processes data files (Stata, SPSS, CSV) to 
   - **Stata (.dta)**
   - **CSV (.csv)**
 - **Geospatial metadata endpoints** (optional – see [Geospatial Installation Guide](README-geospatial.md))
+- **AI metadata reviewer** (optional – see [Metadata Reviewer Installation Guide](README-reviewer.md))
 
 ## Integration
 
 This service is designed to be used in conjunction with the [Metadata Editor web application](https://github.com/worldbank/metadata-editor), enhancing its ability to automate data processing and metadata generation workflows.
 
+## Security model
+
+This FastAPI service is a **local processing worker**, not a public API. It reads and writes files on paths supplied by the Metadata Editor (Stata/SPSS/CSV conversion, data dictionaries, geospatial metadata, and similar tasks).
+
+**Do not expose this service to untrusted networks.** Run it on the same machine as the Metadata Editor and bind to localhost (`127.0.0.1`).
+
+| Control | Recommendation |
+|---------|----------------|
+| Network | `HOST=127.0.0.1` (default). Use `0.0.0.0` only on trusted internal networks with a firewall. |
+| `STORAGE_PATH` | **Required in `.env`** — set an absolute directory path, or `STORAGE_PATH=` (empty) to disable path validation for local development only. |
+| OS permissions | Run under a dedicated service account with access limited to editor data folders. |
+
+Copy `.env.example` to `.env` before starting. The application **will not start** unless `STORAGE_PATH` is explicitly set in `.env`.
+
+**Production deployment (recommended on a server):**
+
+- Linux (systemd): [deploy/linux/README.md](deploy/linux/README.md)
+- Windows (NSSM service): [deploy/windows/README.md](deploy/windows/README.md)
 
 ## Requirements
-Python 3.11 or later
 
-## Dependencies
+- Python **3.11+**
+- [Miniconda3](https://www.anaconda.com/docs/getting-started/miniconda/main) — recommended for production and geospatial features
+- Metadata Editor web app on the **same machine**
 
-```
-fastapi==0.115.12
-numpy==2.2.4
-pandas==2.2.3
-pydantic==2.11.2
-pydantic-settings==2.8.1
-pydantic_core==2.33.1
-pyreadstat==1.2.8
-statsmodels==0.14.4
-uvicorn==0.34.0
-```
-
-## Installation
-
-### Option 1: Direct Installation
-```
-pip install -r requirements.txt
-```
-
-### Option 2: Using Virtual Environment (Recommended)
-```bash
-# Create a virtual environment
-python3 -m venv venv
-
-# Activate the virtual environment
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# To deactivate the virtual environment when done
-deactivate
-```
-
-## Geospatial Endpoints (Optional)
-
-Geospatial endpoints require additional native dependencies (GDAL, Fiona, GeoPandas, etc.) that are not included in `requirements.txt`. These can be difficult to install in standard Python environments, especially on Windows.
-
-The recommended approach is to use **Miniconda3** with the `conda-forge` channel, which provides pre-compiled binaries for all platforms.
-
-See the [Geospatial Installation Guide](README-geospatial.md) for full setup instructions.
+Core Python dependencies are listed in [`requirements.txt`](requirements.txt).
 
 ---
 
-## Start web app
+## Installation
 
-### If using Option 1 (Direct Installation):
+### 1. Configure environment (required)
+
 ```bash
-python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+cp .env.example .env
 ```
 
-### If using Option 2 (Virtual Environment):
+Edit `.env` and set at minimum:
+
+- `STORAGE_PATH` — absolute path to the Metadata Editor data folder (see [Configuration](#storage-path-storage_path) below)
+- `HOST=127.0.0.1` — already the default in `.env.example`
+
+### 2. Python environment
+
+Use **one** of the options below. Choose **Option 1 (Conda)** when you need geospatial endpoints or are on Windows. Choose **Option 2 (`.venv`)** when you only need core features — suitable for development and production alike.
+
+#### Option 1: Conda (`metadata-editor` env) — recommended
+
+Best when you need **geospatial** endpoints or are installing on **Windows**. GDAL and related native libraries come from `conda-forge`.
+
+Full step-by-step: **[Geospatial Installation Guide](README-geospatial.md)** — follow Steps 1–4 even if you only need core features today.
+
+Summary:
+
 ```bash
-# Make sure the virtual environment is activated
-source venv/bin/activate
-
-# Start the application
-python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
-
-# When done, deactivate the virtual environment
-deactivate
+conda create -n metadata-editor python=3.11 -y
+conda activate metadata-editor
+conda install -c conda-forge gdal fiona geopandas rasterio pyproj shapely -y   # skip if core-only
+pip install -r requirements.txt
+pip install metadataschemas pygeohash matplotlib   # geospatial only; see README-geospatial.md
 ```
 
-### Option 3: Using the start/stop scripts (recommended for background use)
+On Windows, enable “Add Miniconda3 to PATH” during install so `start.bat` and the Windows service installer can find conda.
 
-Convenience scripts are provided that start the application as a background process and manage the PID. They auto-detect your Python environment (conda, venv, or system Python).
+#### Option 2: Virtual environment (core features, no geospatial)
 
-**macOS / Linux:**
+Lightweight option when you do **not** need geospatial endpoints — works well for local development and for production when you only need Stata, SPSS, and CSV processing. Use **`.venv`**; the start scripts look for this directory name.
+
+**Linux / macOS:**
+
 ```bash
-./start.sh        # start in background (auto-detects conda env 'metadata-editor', .venv, or system Python)
-./stop.sh         # stop gracefully
-./stop.sh --force # force kill if graceful stop fails
-./start.sh --help # see all options and environment variables
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 **Windows:**
+
 ```bat
-start.bat         :: start in background (auto-detects conda env 'metadata-editor', .venv, or system Python)
-stop.bat          :: stop gracefully
-stop.bat --force  :: force kill if graceful stop fails
-start.bat --help  :: see all options
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-The application will be available at `http://localhost:8000`
+#### Option 3: System Python (not recommended)
+
+Only if you cannot use Conda or a virtual environment — for example, a throwaway test machine or a container where `python` is already isolated.
+
+```bash
+pip install -r requirements.txt
+```
+
+> **Warning:** This installs into the active Python environment (often system-wide). It can conflict with OS-managed packages on Linux, does not support geospatial endpoints, and is unsuitable for production. Prefer Option 1 or Option 2.
+
+### Optional: Geospatial endpoints
+
+Requires the Conda + `conda-forge` setup in Option 1. See **[README-geospatial.md](README-geospatial.md)**.
+
+### Optional: Metadata reviewer
+
+```bash
+pip install -r requirements-reviewer.txt
+cp reviewer.env.example reviewer.env
+# edit reviewer.env with your LLM provider credentials
+```
+
+See **[README-reviewer.md](README-reviewer.md)**.
+
+---
+
+## Running the application
+
+### Development (recommended): start/stop scripts
+
+Scripts auto-detect Python in this order: conda env `metadata-editor` → active conda env → `.venv` → system Python. They read `HOST` and `PORT` from the environment / `.env` and default to **`127.0.0.1:8000`**.
+
+**Linux / macOS:**
+
+```bash
+./start.sh -f      # foreground — best for debugging (Ctrl+C to stop)
+./start.sh         # background
+./stop.sh          # stop gracefully
+./start.sh --help  # all options
+```
+
+**Windows:**
+
+```bat
+start.bat -f       :: foreground
+start.bat          :: background
+stop.bat           :: stop gracefully
+start.bat --help
+```
+
+The API is at `http://127.0.0.1:8000` (localhost only by default).
+
+### Manual start (debugging only)
+
+With your conda env, `.venv`, or system Python configured and `.env` in place:
+
+```bash
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+Add `--reload` for auto-reload during development (not used by the start scripts or production services).
+
+### Production: OS service
+
+Do **not** rely on `start.sh` / `start.bat` for a production Metadata Editor server. Install as a service so the API starts at boot and runs under a dedicated account:
+
+| OS | Guide | Mechanism |
+|----|--------|-----------|
+| **Linux** | [deploy/linux/README.md](deploy/linux/README.md) | systemd (`install-service.sh`) |
+| **Windows** | [deploy/windows/README.md](deploy/windows/README.md) | NSSM (`install-service.bat`) |
+
+Both guides install via an explicit Python path (commonly Conda `metadata-editor`). A `.venv` interpreter works the same way when geospatial packages are not required.
+
+---
 
 ## Configuration
 
-### Storage Path Configuration
-The `STORAGE_PATH` should point to the folder used by the metadata editor for data storage. 
+### Environment file
 
 ```bash
-# Set the path to your data files directory
-STORAGE_PATH=/path/to/your/metadata-editor/datafiles
+cp .env.example .env
 ```
 
-**Important Notes:**
-- **Permissions**: The application must have read/write access to this directory
-- **Path Format**: Use absolute paths (e.g., `/Volumes/webdev/data` on macOS/Linux, `C:\data` on Windows)
-- **Validation**: The application will fail to start if the path doesn't exist or is inaccessible
+### Storage path (`STORAGE_PATH`)
 
+`STORAGE_PATH` must be **explicitly set** in `.env`. The application will refuse to start if it is missing.
 
-### Logging Configuration
-
-To enable error logging, copy the contents of `env_configuration_example.txt` to end of the `.env` file and modify as needed:
-
-Control logging verbosity and output through environment variables:
+| Value | Behavior |
+|-------|----------|
+| Absolute directory path | Restricts file operations on endpoints that read or write user-supplied paths |
+| Empty (`STORAGE_PATH=`) | Disables path validation — **local development only** |
 
 ```bash
-# Production (clean output, errors only)
+# Production — point at the metadata editor data folder
+STORAGE_PATH=/path/to/your/metadata-editor/datafiles
+
+# Local development only — disable path validation
+# STORAGE_PATH=
+```
+
+**Notes:**
+- Use **absolute paths** (e.g. `/var/www/metadata-editor/datafiles` on Linux, `C:\inetpub\metadata-editor\datafiles` on Windows)
+- The directory must exist when a path is set; the application validates this at startup
+- The service account must have read/write access to this directory
+
+### Logging configuration
+
+Copy variables from `logging_config_example.env` into your `.env` file and adjust as needed.
+
+Logs include a timestamp on each line. By default, output goes to the console and to `logs/app.log`, with a new file created at midnight (`logs/app.log.YYYY-MM-DD`). Log files are appended across restarts and retained for 30 days.
+
+```bash
+# Production (errors only, file + console)
 LOG_LEVEL=ERROR
-LOG_FORMAT=simple
-LOG_TO_FILE=false
+LOG_FORMAT=timestamp
+LOG_TO_FILE=true
 
 # Development (detailed debugging)
 LOG_LEVEL=DEBUG
 LOG_FORMAT=detailed
-LOG_TO_FILE=false
+LOG_TO_FILE=true
 
-# File logging with timestamps
+# Console only (no file)
 LOG_LEVEL=INFO
 LOG_FORMAT=timestamp
-LOG_TO_FILE=true
-# Log file path (only used if LOG_TO_FILE=true)
-# Default: logs/error-YYYY-MM-DD.log
-LOG_FILE_PATH=logs/error-2025-08-22.log
+LOG_TO_FILE=false
+
+# Optional overrides
+# LOG_FILE_PATH=logs/app.log
+# LOG_RETENTION_DAYS=30
 ```
 
-### Complete Setup Example
-Here's a complete `.env` file setup for a typical development environment:
+### Complete setup example
+
+Example `.env` for local development:
 
 ```bash
-# Storage configuration
-STORAGE_PATH=/Users/username/projects/metadata-editor/datafiles
+# Storage — required (use empty STORAGE_PATH= for dev-only validation off)
+STORAGE_PATH=/path/to/metadata-editor/datafiles
 
-# Logging configuration (development mode)
+# Server
+HOST=127.0.0.1
+PORT=8000
+
+# Logging
 LOG_LEVEL=DEBUG
 LOG_FORMAT=detailed
-LOG_TO_FILE=false
+LOG_TO_FILE=true
 
 # Job management
 CLEANUP_INTERVAL_HOURS=1
 MAX_JOB_AGE_HOURS=24
 MAX_MEMORY_JOBS=500
-
-# Server configuration
-HOST=127.0.0.1
-PORT=8000
-RELOAD=true
 ```
 
 ## License
