@@ -13,4 +13,3 @@ jobs/*
 !jobs/index.html
 external/geometadatatools/.git
 *.ipynb
-requirements-geospatial.txt
